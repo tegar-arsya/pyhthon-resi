@@ -339,41 +339,61 @@ if file_resi and file_laporan:
         ensure_col(df_laporan_out, 'Somasi Match',          'bool',  False)
 
         # === MODE A: FULL MATCH (fuzzy Nama Debitur ↔ Nama Penerima dari Resi) ===
+        # Pencocokan 1:1 — setiap baris resi hanya boleh dipakai SEKALI
         if not only_somasi_mode:
-            resi_names = df_resi['Nama Penerima'].fillna("").astype(str).tolist()
+            # Buat daftar kandidat resi dengan index asli, agar bisa ditandai "sudah dipakai"
+            resi_candidates = []
+            for resi_idx, resi_row in df_resi.iterrows():
+                resi_candidates.append({
+                    'resi_idx': resi_idx,
+                    'nama': str(resi_row.get('Nama Penerima', '') or '').strip(),
+                    'used': False,
+                    'row': resi_row,
+                })
 
-            def fuzzy_match_name(q, candidates, min_score):
-                q = q.strip()
-                if not q or not candidates:
-                    return None, 0
-                res = process.extractOne(q, candidates)
+            def fuzzy_match_name_1to1(query, candidates, min_score):
+                """Cari kandidat resi terbaik yang BELUM dipakai."""
+                query = query.strip()
+                if not query:
+                    return None, 0, -1
+                available = [(c['nama'], i) for i, c in enumerate(candidates) if not c['used'] and c['nama']]
+                if not available:
+                    return None, 0, -1
+                names_only = [a[0] for a in available]
+                res = process.extractOne(query, names_only)
                 if not res:
-                    return None, 0
-                match, score = res
-                return (match, score) if score >= min_score else (None, 0)
+                    return None, 0, -1
+                match_name, score = res
+                if score < min_score:
+                    return None, 0, -1
+                # Cari index kandidat yang cocok (ambil yang pertama ditemukan)
+                for name, cand_i in available:
+                    if name == match_name:
+                        return match_name, score, cand_i
+                return None, 0, -1
 
             for idx, row in df_laporan_out.iterrows():
                 nm = str(row['Nama Debitur'])
-                m, sc = fuzzy_match_name(nm, resi_names, threshold_name)
-                if m:
-                    r = df_resi[df_resi['Nama Penerima'] == m].head(1)
-                    if not r.empty:
-                        res_row = r.iloc[0]
+                m, sc, cand_i = fuzzy_match_name_1to1(nm, resi_candidates, threshold_name)
+                if m and cand_i >= 0:
+                    # Tandai resi ini sudah dipakai (tidak bisa dipakai baris lain)
+                    resi_candidates[cand_i]['used'] = True
+                    res_row = resi_candidates[cand_i]['row']
 
-                        # isi nama penerima
-                        df_laporan_out.at[idx, 'Nama Penerima Somasi'] = get_str(res_row.get('Nama Penerima'))
+                    # isi nama penerima
+                    df_laporan_out.at[idx, 'Nama Penerima Somasi'] = get_str(res_row.get('Nama Penerima'))
 
-                        # ambil nomor resi dari dua kemungkinan kolom
-                        resi_val = ""
-                        if 'Nomor Resi Pengiriman' in r.columns and pd.notna(res_row.get('Nomor Resi Pengiriman')):
-                            resi_val = get_str(res_row.get('Nomor Resi Pengiriman'))
-                        elif 'Nomor Resi' in r.columns and pd.notna(res_row.get('Nomor Resi')):
-                            resi_val = get_str(res_row.get('Nomor Resi'))
+                    # ambil nomor resi dari dua kemungkinan kolom
+                    resi_val = ""
+                    if 'Nomor Resi Pengiriman' in df_resi.columns and pd.notna(res_row.get('Nomor Resi Pengiriman')):
+                        resi_val = get_str(res_row.get('Nomor Resi Pengiriman'))
+                    elif 'Nomor Resi' in df_resi.columns and pd.notna(res_row.get('Nomor Resi')):
+                        resi_val = get_str(res_row.get('Nomor Resi'))
 
-                        if resi_val:
-                            df_laporan_out.at[idx, 'Nomor Resi Pengiriman'] = resi_val
+                    if resi_val:
+                        df_laporan_out.at[idx, 'Nomor Resi Pengiriman'] = resi_val
 
-                        df_laporan_out.at[idx, 'Similarity Score (Nama)'] = int(sc)
+                    df_laporan_out.at[idx, 'Similarity Score (Nama)'] = int(sc)
 
         else:
             st.info("🧩 Mode ringan aktif: hanya mencocokkan Nomor Surat Somasi berdasarkan Nama / No. Kontrak.")
