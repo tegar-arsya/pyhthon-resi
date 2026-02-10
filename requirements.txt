@@ -3,5 +3,4 @@ pandas
 fuzzywuzzy
 python-Levenshtein
 openpyxl
-re
 pdfplumber
