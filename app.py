@@ -9,7 +9,7 @@ import pdfplumber  # <-- tambahan untuk baca PDF
 # =========================
 # Konfigurasi halaman
 # =========================
-st.set_page_config(page_title="Pencocokan Data & Duplikat", layout="wide")
+st.set_page_config(page_title="Pencocokan Somasi", layout="wide")
 
 # =========================
 # Normalisasi & Pemetaan Kolom
@@ -178,11 +178,210 @@ def write_excel_download(df: pd.DataFrame, default_filename: str):
 def get_str(val) -> str:
     return "" if pd.isna(val) else str(val)
 
+def normalize_resi(s: str) -> str:
+    if pd.isna(s):
+        return ""
+    if isinstance(s, float) and s.is_integer():
+        s = str(int(s))
+    else:
+        s = str(s)
+    s = s.strip().lstrip("'").replace("\xa0", " ")
+    s = re.sub(r'\s+', '', s).upper()
+    if re.match(r'^\d+\.0$', s):
+        s = s[:-2]
+    return s
+
+def normalize_column_key(name: str) -> str:
+    name = strip_enumeration_prefix(str(name or ""))
+    name = name.replace("\ufeff", "").replace("\xa0", " ")
+    name = re.sub(r'\s+', ' ', name).strip().lower()
+    return re.sub(r'[^a-z0-9]+', '', name)
+
+def find_column(df: pd.DataFrame, *candidates: str):
+    columns_by_key = {normalize_column_key(c): c for c in df.columns}
+    for candidate in candidates:
+        if candidate in df.columns:
+            return candidate
+        key = normalize_column_key(candidate)
+        if key in columns_by_key:
+            return columns_by_key[key]
+    return None
+
+def format_date_for_report(val) -> str:
+    if pd.isna(val):
+        return ""
+    if hasattr(val, "strftime") and not isinstance(val, str):
+        return val.strftime("%d/%m/%Y")
+    return str(val).strip()
+
+def write_csv_download(df: pd.DataFrame, default_filename: str):
+    data = df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        label=f"📥 Download {default_filename}",
+        data=data,
+        file_name=default_filename,
+        mime="text/csv",
+    )
+
 # =========================
 # UI
 # =========================
+st.sidebar.header("📌 Menu")
+active_tab = st.sidebar.radio(
+    "Pilih tab",
+    ["Pencocokan Somasi", "Pencocokan No Resi dan Detail"],
+    label_visibility="collapsed",
+)
+st.sidebar.markdown("---")
+
+if active_tab == "Pencocokan No Resi dan Detail":
+    st.markdown("# 📦 Pencocokan No Resi dan Detail")
+
+    try:
+        image = Image.open("custody.png")
+        st.image(image, caption="Logo Aplikasi", width=200)
+    except Exception:
+        pass
+
+    st.sidebar.header("📤 Upload Berkas")
+    file_laporan_detail = st.sidebar.file_uploader(
+        "Laporan CSV",
+        type=["csv"],
+        key="laporan_detail_resi",
+    )
+    file_detail_resi = st.sidebar.file_uploader(
+        "Detail Resi XLSX",
+        type=["xlsx"],
+        key="detail_resi_xlsx",
+    )
+
+    if file_laporan_detail and file_detail_resi:
+        df_laporan_detail = load_file_flex(file_laporan_detail)
+        df_detail_resi = load_file_flex(file_detail_resi)
+
+        detail_no_resi_col = find_column(df_detail_resi, "No Resi", "Nomor Resi", "Nomor Resi Pengiriman")
+        detail_penerima_paket_col = find_column(df_detail_resi, "Penerima Paket")
+        detail_status_penerima_col = find_column(df_detail_resi, "Status Penerima")
+        detail_tanggal_col = find_column(df_detail_resi, "Tanggal")
+
+        laporan_no_resi_col = find_column(df_laporan_detail, "Nomor Resi Pengiriman", "No Resi", "Nomor Resi")
+        laporan_penerima_col = find_column(df_laporan_detail, "NAMA PENERIMA EKSPEDISI SOMASI")
+        laporan_status_col = find_column(df_laporan_detail, "STATUS PENERIMA EKSPEDISI SOMASI")
+        laporan_tanggal_col = find_column(df_laporan_detail, "Tanggal Somasi Diterima")
+
+        created_columns = []
+        if laporan_penerima_col is None:
+            laporan_penerima_col = "NAMA PENERIMA EKSPEDISI SOMASI"
+            df_laporan_detail[laporan_penerima_col] = ""
+            created_columns.append(laporan_penerima_col)
+        if laporan_status_col is None:
+            laporan_status_col = "STATUS PENERIMA EKSPEDISI SOMASI"
+            df_laporan_detail[laporan_status_col] = ""
+            created_columns.append(laporan_status_col)
+        if laporan_tanggal_col is None:
+            laporan_tanggal_col = "Tanggal Somasi Diterima"
+            df_laporan_detail[laporan_tanggal_col] = ""
+            created_columns.append(laporan_tanggal_col)
+
+        with st.expander("🔧 Kolom terdeteksi"):
+            st.write("Laporan:", list(df_laporan_detail.columns))
+            st.write("Detail Resi:", list(df_detail_resi.columns))
+            if created_columns:
+                st.write("Kolom laporan yang dibuat:", created_columns)
+
+        missing_cols = []
+        if laporan_no_resi_col is None:
+            missing_cols.append("Laporan: Nomor Resi Pengiriman")
+        if detail_no_resi_col is None:
+            missing_cols.append("Detail Resi: No Resi")
+        if detail_penerima_paket_col is None:
+            missing_cols.append("Detail Resi: Penerima Paket")
+        if detail_status_penerima_col is None:
+            missing_cols.append("Detail Resi: Status Penerima")
+        if detail_tanggal_col is None:
+            missing_cols.append("Detail Resi: Tanggal")
+
+        if missing_cols:
+            st.error(f"Kolom wajib tidak ditemukan: {missing_cols}")
+            st.stop()
+
+        col_lap, col_detail = st.columns(2)
+        with col_lap:
+            st.subheader("📊 Laporan")
+            st.dataframe(make_streamlit_safe(df_laporan_detail))
+        with col_detail:
+            st.subheader("📦 Detail Resi")
+            st.dataframe(make_streamlit_safe(df_detail_resi))
+
+        if st.button("🚀 Cocokkan No Resi dan Isi Detail"):
+            df_laporan_out = df_laporan_detail.copy()
+            df_detail_work = df_detail_resi.copy()
+
+            df_laporan_out["__resi_norm"] = df_laporan_out[laporan_no_resi_col].apply(normalize_resi)
+            df_detail_work["__resi_norm"] = df_detail_work[detail_no_resi_col].apply(normalize_resi)
+            df_detail_work = df_detail_work[df_detail_work["__resi_norm"] != ""].copy()
+
+            duplicate_detail = df_detail_work[df_detail_work.duplicated("__resi_norm", keep=False)].copy()
+            detail_lookup = (
+                df_detail_work
+                .drop_duplicates("__resi_norm", keep="first")
+                .set_index("__resi_norm", drop=False)
+            )
+
+            matched_count = 0
+            empty_resi_count = 0
+            unmatched_idx = []
+
+            for idx, row in df_laporan_out.iterrows():
+                resi_norm = row["__resi_norm"]
+                if not resi_norm:
+                    empty_resi_count += 1
+                    continue
+                if resi_norm not in detail_lookup.index:
+                    unmatched_idx.append(idx)
+                    continue
+
+                detail_row = detail_lookup.loc[resi_norm]
+                df_laporan_out.at[idx, laporan_penerima_col] = get_str(detail_row.get(detail_penerima_paket_col))
+                df_laporan_out.at[idx, laporan_status_col] = get_str(detail_row.get(detail_status_penerima_col))
+                df_laporan_out.at[idx, laporan_tanggal_col] = format_date_for_report(detail_row.get(detail_tanggal_col))
+                matched_count += 1
+
+            df_laporan_out = df_laporan_out.drop(columns=["__resi_norm"])
+
+            st.subheader("✅ Hasil Pencocokan No Resi dan Detail")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Baris Laporan", len(df_laporan_detail))
+            m2.metric("Berhasil Cocok", matched_count)
+            m3.metric("Resi Tidak Ditemukan", len(unmatched_idx))
+            m4.metric("No Resi Kosong", empty_resi_count)
+
+            if not duplicate_detail.empty:
+                st.warning("Ada No Resi duplikat di Detail Resi. Aplikasi memakai baris pertama untuk pengisian laporan.")
+                duplicate_cols = [
+                    c for c in [
+                        detail_no_resi_col,
+                        detail_penerima_paket_col,
+                        detail_status_penerima_col,
+                        detail_tanggal_col,
+                    ] if c in duplicate_detail.columns
+                ]
+                st.dataframe(make_streamlit_safe(duplicate_detail[duplicate_cols]))
+
+            if unmatched_idx:
+                st.warning("Beberapa Nomor Resi Pengiriman di laporan tidak ditemukan pada Detail Resi.")
+                st.dataframe(make_streamlit_safe(df_laporan_detail.loc[unmatched_idx, [laporan_no_resi_col]]))
+
+            st.dataframe(make_streamlit_safe(df_laporan_out))
+            write_excel_download(df_laporan_out, "laporan_detail_resi_terupdate.xlsx")
+            write_csv_download(df_laporan_out, "laporan_detail_resi_terupdate.csv")
+    else:
+        st.info("📎 Upload **Laporan CSV** dan **Detail Resi XLSX** untuk mulai mencocokkan No Resi.")
+
+    st.stop()
+
 st.markdown("""
-# 🚀 Aplikasi Pencocokan Data dan Pengecekan Duplikat
+# 🚀 Pencocokan Somasi
 1) Fuzzy **Nama Debitur ↔ Nama Penerima** (opsional)  
 2) **Isi/Cek Nomor Surat Somasi** dari **Bahan** (berdasar **No. Kontrak** → fallback fuzzy **Nama**)
 """)
