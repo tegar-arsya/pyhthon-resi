@@ -4,7 +4,6 @@ from fuzzywuzzy import process
 from io import BytesIO
 from PIL import Image
 import re
-import pdfplumber  # <-- tambahan untuk baca PDF
 
 # =========================
 # Konfigurasi halaman
@@ -103,6 +102,15 @@ def load_file_flex(uploaded_file):
 def load_resi_file(uploaded_file):
     name = uploaded_file.name.lower()
     if name.endswith(".pdf"):
+        try:
+            import pdfplumber
+        except (ImportError, OSError):
+            st.error(
+                "❌ Pembaca PDF tidak dapat dimuat. Gunakan file XLSX/CSV/TSV "
+                "atau perbaiki instalasi pdfplumber/cryptography."
+            )
+            return pd.DataFrame(columns=["Nama Penerima", "Nomor Resi"])
+
         # Ekstrak tabel dari PDF menggunakan pdfplumber
         tables = []
         header = None
@@ -207,12 +215,185 @@ def find_column(df: pd.DataFrame, *candidates: str):
             return columns_by_key[key]
     return None
 
+def build_name_candidates(df: pd.DataFrame, name_col: str):
+    """Siapkan kandidat nama yang dapat dipakai satu kali saat fuzzy matching."""
+    candidates = []
+    for source_idx, row in df.iterrows():
+        display_name = get_str(row.get(name_col)).strip()
+        candidates.append({
+            "source_idx": source_idx,
+            "nama": display_name,
+            "nama_norm": normalize_nama(display_name),
+            "used": False,
+            "row": row,
+        })
+    return candidates
+
+def fuzzy_match_name_1to1(query, candidates, min_score):
+    """Cari kandidat nama terbaik yang belum dipakai."""
+    query_norm = normalize_nama(query)
+    if not query_norm:
+        return None, 0, -1
+
+    available = [
+        (candidate["nama_norm"], candidate_idx)
+        for candidate_idx, candidate in enumerate(candidates)
+        if not candidate["used"] and candidate["nama_norm"]
+    ]
+    if not available:
+        return None, 0, -1
+
+    result = process.extractOne(query_norm, [name for name, _ in available])
+    if not result:
+        return None, 0, -1
+
+    matched_name, score = result
+    if score < min_score:
+        return None, int(score), -1
+
+    for name, candidate_idx in available:
+        if name == matched_name:
+            return candidates[candidate_idx]["nama"], int(score), candidate_idx
+    return None, 0, -1
+
 def format_date_for_report(val) -> str:
     if pd.isna(val):
         return ""
     if hasattr(val, "strftime") and not isinstance(val, str):
         return val.strftime("%d/%m/%Y")
     return str(val).strip()
+
+def match_laporan_with_detail(
+    df_laporan,
+    df_detail,
+    *,
+    laporan_no_resi_col,
+    laporan_nama_debitur_col,
+    laporan_penerima_col,
+    laporan_status_col,
+    laporan_tanggal_col,
+    laporan_similarity_col,
+    detail_no_resi_col,
+    detail_nama_penerima_col,
+    detail_penerima_paket_col,
+    detail_status_penerima_col,
+    detail_tanggal_col,
+    threshold_name,
+):
+    """Isi resi/detail: prioritaskan resi yang ada, lalu fuzzy match nama 1:1."""
+    laporan_out = df_laporan.copy()
+    detail_work = df_detail.copy()
+
+    laporan_out["__resi_norm"] = laporan_out[laporan_no_resi_col].apply(normalize_resi)
+    detail_work["__resi_norm"] = detail_work[detail_no_resi_col].apply(normalize_resi)
+    detail_work = detail_work[detail_work["__resi_norm"] != ""].copy()
+
+    duplicate_detail = detail_work[detail_work.duplicated("__resi_norm", keep=False)].copy()
+    detail_unique = detail_work.drop_duplicates("__resi_norm", keep="first").copy()
+    detail_lookup = {}
+    for detail_idx, detail_row in detail_unique.iterrows():
+        detail_lookup.setdefault(detail_row["__resi_norm"], (detail_idx, detail_row))
+
+    needs_name_matching = laporan_out["__resi_norm"].eq("").any()
+    detail_candidates = (
+        build_name_candidates(detail_unique, detail_nama_penerima_col)
+        if needs_name_matching else []
+    )
+    candidate_by_source_idx = {
+        candidate["source_idx"]: candidate_idx
+        for candidate_idx, candidate in enumerate(detail_candidates)
+    }
+
+    laporan_out[laporan_similarity_col] = pd.to_numeric(
+        laporan_out[laporan_similarity_col], errors="coerce"
+    ).fillna(0).astype("int64")
+
+    matched_by_resi = 0
+    matched_by_name = 0
+    unmatched_records = []
+    row_number_by_idx = {idx: position + 2 for position, idx in enumerate(laporan_out.index)}
+
+    def fill_detail(report_idx, detail_row, similarity_score=None, fill_resi=False):
+        if fill_resi:
+            laporan_out.at[report_idx, laporan_no_resi_col] = get_str(
+                detail_row.get(detail_no_resi_col)
+            )
+        laporan_out.at[report_idx, laporan_penerima_col] = get_str(
+            detail_row.get(detail_penerima_paket_col)
+        )
+        laporan_out.at[report_idx, laporan_status_col] = get_str(
+            detail_row.get(detail_status_penerima_col)
+        )
+        laporan_out.at[report_idx, laporan_tanggal_col] = format_date_for_report(
+            detail_row.get(detail_tanggal_col)
+        )
+        if similarity_score is not None:
+            laporan_out.at[report_idx, laporan_similarity_col] = int(similarity_score)
+
+    # Pass 1: nomor resi yang sudah tersedia selalu mendapat prioritas.
+    for idx, row in laporan_out.iterrows():
+        resi_norm = row["__resi_norm"]
+        if not resi_norm:
+            continue
+        if resi_norm not in detail_lookup:
+            unmatched_records.append({
+                "Baris Laporan": row_number_by_idx[idx],
+                "Nama Debitur": (
+                    get_str(row.get(laporan_nama_debitur_col))
+                    if laporan_nama_debitur_col else ""
+                ),
+                "Nomor Resi": get_str(row.get(laporan_no_resi_col)),
+                "Alasan": "Nomor resi tidak ditemukan di Detail Resi",
+            })
+            continue
+
+        detail_idx, detail_row = detail_lookup[resi_norm]
+        candidate_idx = candidate_by_source_idx.get(detail_idx)
+        if candidate_idx is not None:
+            detail_candidates[candidate_idx]["used"] = True
+        fill_detail(idx, detail_row)
+        matched_by_resi += 1
+
+    # Pass 2: nomor resi kosong diisi lewat fuzzy matching nama secara 1:1.
+    for idx, row in laporan_out.iterrows():
+        if row["__resi_norm"]:
+            continue
+
+        nama_debitur = get_str(row.get(laporan_nama_debitur_col))
+        matched_name, score, candidate_idx = fuzzy_match_name_1to1(
+            nama_debitur,
+            detail_candidates,
+            threshold_name,
+        )
+        if not matched_name or candidate_idx < 0:
+            unmatched_records.append({
+                "Baris Laporan": row_number_by_idx[idx],
+                "Nama Debitur": nama_debitur,
+                "Nomor Resi": "",
+                "Alasan": (
+                    f"Nama tidak mencapai ambang similarity {threshold_name}"
+                    if nama_debitur else "Nama Debitur kosong"
+                ),
+            })
+            continue
+
+        detail_candidates[candidate_idx]["used"] = True
+        fill_detail(
+            idx,
+            detail_candidates[candidate_idx]["row"],
+            similarity_score=score,
+            fill_resi=True,
+        )
+        matched_by_name += 1
+
+    laporan_out = laporan_out.drop(columns=["__resi_norm"])
+    return {
+        "laporan": laporan_out,
+        "duplicate_detail": duplicate_detail,
+        "matched_by_resi": matched_by_resi,
+        "matched_by_name": matched_by_name,
+        "unmatched_records": unmatched_records,
+    }
 
 def write_csv_download(df: pd.DataFrame, default_filename: str):
     data = df.to_csv(index=False).encode("utf-8-sig")
@@ -254,22 +435,48 @@ if active_tab == "Pencocokan No Resi dan Detail":
         type=["xlsx"],
         key="detail_resi_xlsx",
     )
+    threshold_detail_name = st.sidebar.slider(
+        "Ambang Similarity Nama Debitur ↔ Nama Penerima",
+        0,
+        100,
+        80,
+        1,
+        key="threshold_detail_name",
+        help="Dipakai hanya untuk baris laporan yang nomor resinya masih kosong.",
+    )
 
     if file_laporan_detail and file_detail_resi:
         df_laporan_detail = load_file_flex(file_laporan_detail)
         df_detail_resi = load_file_flex(file_detail_resi)
 
         detail_no_resi_col = find_column(df_detail_resi, "No Resi", "Nomor Resi", "Nomor Resi Pengiriman")
+        detail_nama_penerima_col = find_column(
+            df_detail_resi,
+            "Nama Penerima",
+            "Nama Penerima Somasi",
+            "Nama Debitur",
+            "Nama Konsumen",
+        )
         detail_penerima_paket_col = find_column(df_detail_resi, "Penerima Paket")
         detail_status_penerima_col = find_column(df_detail_resi, "Status Penerima")
         detail_tanggal_col = find_column(df_detail_resi, "Tanggal")
 
         laporan_no_resi_col = find_column(df_laporan_detail, "Nomor Resi Pengiriman", "No Resi", "Nomor Resi")
+        laporan_nama_debitur_col = find_column(
+            df_laporan_detail,
+            "Nama Debitur",
+            "Nama Konsumen",
+        )
         laporan_penerima_col = find_column(df_laporan_detail, "NAMA PENERIMA EKSPEDISI SOMASI")
         laporan_status_col = find_column(df_laporan_detail, "STATUS PENERIMA EKSPEDISI SOMASI")
         laporan_tanggal_col = find_column(df_laporan_detail, "Tanggal Somasi Diterima")
+        laporan_similarity_col = find_column(df_laporan_detail, "Similarity Score (Nama Resi)")
 
         created_columns = []
+        if laporan_no_resi_col is None:
+            laporan_no_resi_col = "Nomor Resi Pengiriman"
+            df_laporan_detail[laporan_no_resi_col] = ""
+            created_columns.append(laporan_no_resi_col)
         if laporan_penerima_col is None:
             laporan_penerima_col = "NAMA PENERIMA EKSPEDISI SOMASI"
             df_laporan_detail[laporan_penerima_col] = ""
@@ -282,6 +489,12 @@ if active_tab == "Pencocokan No Resi dan Detail":
             laporan_tanggal_col = "Tanggal Somasi Diterima"
             df_laporan_detail[laporan_tanggal_col] = ""
             created_columns.append(laporan_tanggal_col)
+        if laporan_similarity_col is None:
+            laporan_similarity_col = "Similarity Score (Nama Resi)"
+            df_laporan_detail[laporan_similarity_col] = 0
+            created_columns.append(laporan_similarity_col)
+
+        needs_name_matching = df_laporan_detail[laporan_no_resi_col].apply(normalize_resi).eq("").any()
 
         with st.expander("🔧 Kolom terdeteksi"):
             st.write("Laporan:", list(df_laporan_detail.columns))
@@ -290,8 +503,6 @@ if active_tab == "Pencocokan No Resi dan Detail":
                 st.write("Kolom laporan yang dibuat:", created_columns)
 
         missing_cols = []
-        if laporan_no_resi_col is None:
-            missing_cols.append("Laporan: Nomor Resi Pengiriman")
         if detail_no_resi_col is None:
             missing_cols.append("Detail Resi: No Resi")
         if detail_penerima_paket_col is None:
@@ -300,6 +511,10 @@ if active_tab == "Pencocokan No Resi dan Detail":
             missing_cols.append("Detail Resi: Status Penerima")
         if detail_tanggal_col is None:
             missing_cols.append("Detail Resi: Tanggal")
+        if needs_name_matching and laporan_nama_debitur_col is None:
+            missing_cols.append("Laporan: Nama Debitur (diperlukan karena ada No Resi kosong)")
+        if needs_name_matching and detail_nama_penerima_col is None:
+            missing_cols.append("Detail Resi: Nama Penerima (diperlukan karena ada No Resi kosong)")
 
         if missing_cols:
             st.error(f"Kolom wajib tidak ditemukan: {missing_cols}")
@@ -313,54 +528,51 @@ if active_tab == "Pencocokan No Resi dan Detail":
             st.subheader("📦 Detail Resi")
             st.dataframe(make_streamlit_safe(df_detail_resi))
 
-        if st.button("🚀 Cocokkan No Resi dan Isi Detail"):
-            df_laporan_out = df_laporan_detail.copy()
-            df_detail_work = df_detail_resi.copy()
-
-            df_laporan_out["__resi_norm"] = df_laporan_out[laporan_no_resi_col].apply(normalize_resi)
-            df_detail_work["__resi_norm"] = df_detail_work[detail_no_resi_col].apply(normalize_resi)
-            df_detail_work = df_detail_work[df_detail_work["__resi_norm"] != ""].copy()
-
-            duplicate_detail = df_detail_work[df_detail_work.duplicated("__resi_norm", keep=False)].copy()
-            detail_lookup = (
-                df_detail_work
-                .drop_duplicates("__resi_norm", keep="first")
-                .set_index("__resi_norm", drop=False)
+        if needs_name_matching:
+            st.info(
+                "Baris laporan dengan nomor resi kosong akan dicocokkan 1:1 melalui "
+                "**Nama Debitur ↔ Nama Penerima**. Nomor resi yang sudah terisi tetap "
+                "diprioritaskan untuk pencocokan langsung."
             )
 
-            matched_count = 0
-            empty_resi_count = 0
-            unmatched_idx = []
-
-            for idx, row in df_laporan_out.iterrows():
-                resi_norm = row["__resi_norm"]
-                if not resi_norm:
-                    empty_resi_count += 1
-                    continue
-                if resi_norm not in detail_lookup.index:
-                    unmatched_idx.append(idx)
-                    continue
-
-                detail_row = detail_lookup.loc[resi_norm]
-                df_laporan_out.at[idx, laporan_penerima_col] = get_str(detail_row.get(detail_penerima_paket_col))
-                df_laporan_out.at[idx, laporan_status_col] = get_str(detail_row.get(detail_status_penerima_col))
-                df_laporan_out.at[idx, laporan_tanggal_col] = format_date_for_report(detail_row.get(detail_tanggal_col))
-                matched_count += 1
-
-            df_laporan_out = df_laporan_out.drop(columns=["__resi_norm"])
+        if st.button("🚀 Cocokkan No Resi dan Isi Detail"):
+            match_result = match_laporan_with_detail(
+                df_laporan_detail,
+                df_detail_resi,
+                laporan_no_resi_col=laporan_no_resi_col,
+                laporan_nama_debitur_col=laporan_nama_debitur_col,
+                laporan_penerima_col=laporan_penerima_col,
+                laporan_status_col=laporan_status_col,
+                laporan_tanggal_col=laporan_tanggal_col,
+                laporan_similarity_col=laporan_similarity_col,
+                detail_no_resi_col=detail_no_resi_col,
+                detail_nama_penerima_col=detail_nama_penerima_col,
+                detail_penerima_paket_col=detail_penerima_paket_col,
+                detail_status_penerima_col=detail_status_penerima_col,
+                detail_tanggal_col=detail_tanggal_col,
+                threshold_name=threshold_detail_name,
+            )
+            df_laporan_out = match_result["laporan"]
+            duplicate_detail = match_result["duplicate_detail"]
+            matched_by_resi = match_result["matched_by_resi"]
+            matched_by_name = match_result["matched_by_name"]
+            unmatched_records = match_result["unmatched_records"]
+            matched_count = matched_by_resi + matched_by_name
 
             st.subheader("✅ Hasil Pencocokan No Resi dan Detail")
-            m1, m2, m3, m4 = st.columns(4)
+            m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Baris Laporan", len(df_laporan_detail))
             m2.metric("Berhasil Cocok", matched_count)
-            m3.metric("Resi Tidak Ditemukan", len(unmatched_idx))
-            m4.metric("No Resi Kosong", empty_resi_count)
+            m3.metric("Via No Resi", matched_by_resi)
+            m4.metric("Via Nama", matched_by_name)
+            m5.metric("Tidak Cocok", len(unmatched_records))
 
             if not duplicate_detail.empty:
                 st.warning("Ada No Resi duplikat di Detail Resi. Aplikasi memakai baris pertama untuk pengisian laporan.")
                 duplicate_cols = [
                     c for c in [
                         detail_no_resi_col,
+                        detail_nama_penerima_col,
                         detail_penerima_paket_col,
                         detail_status_penerima_col,
                         detail_tanggal_col,
@@ -368,9 +580,9 @@ if active_tab == "Pencocokan No Resi dan Detail":
                 ]
                 st.dataframe(make_streamlit_safe(duplicate_detail[duplicate_cols]))
 
-            if unmatched_idx:
-                st.warning("Beberapa Nomor Resi Pengiriman di laporan tidak ditemukan pada Detail Resi.")
-                st.dataframe(make_streamlit_safe(df_laporan_detail.loc[unmatched_idx, [laporan_no_resi_col]]))
+            if unmatched_records:
+                st.warning("Beberapa baris laporan belum dapat dicocokkan dengan Detail Resi.")
+                st.dataframe(pd.DataFrame(unmatched_records), hide_index=True)
 
             st.dataframe(make_streamlit_safe(df_laporan_out))
             write_excel_download(df_laporan_out, "laporan_detail_resi_terupdate.xlsx")
@@ -392,8 +604,18 @@ try:
 except Exception:
     pass
 
+st.sidebar.header("⚙️ Mode Pencocokan")
+only_somasi_mode = st.sidebar.checkbox("🔖 Hanya cocokkan **Nomor Surat Somasi** (berdasar Nama / No. Kontrak)")
+
 st.sidebar.header("📤 Upload Berkas")
-file_resi    = st.sidebar.file_uploader("Resi (xlsx/csv/tsv/pdf)",    type=["xlsx", "csv", "tsv", "pdf"])
+if only_somasi_mode:
+    file_resi = None
+    st.sidebar.caption("File Resi tidak diperlukan pada mode Hanya Somasi.")
+else:
+    file_resi = st.sidebar.file_uploader(
+        "Resi (xlsx/csv/tsv/pdf)",
+        type=["xlsx", "csv", "tsv", "pdf"],
+    )
 file_laporan = st.sidebar.file_uploader("Laporan (xlsx/csv/tsv)",     type=["xlsx", "csv", "tsv"])
 files_bahan  = st.sidebar.file_uploader(
     "Bahan (boleh banyak, opsional) – berisi '3. NOMOR SURAT SOMASI' & '4. NAMA KONSUMEN'",
@@ -401,7 +623,6 @@ files_bahan  = st.sidebar.file_uploader(
 )
 
 st.sidebar.markdown("---")
-only_somasi_mode = st.sidebar.checkbox("🔖 Hanya cocokkan **Nomor Surat Somasi** (berdasar Nama / No. Kontrak)")
 somasi_priority = st.sidebar.radio(
     "Prioritas pencocokan Somasi (saat mengisi dari Bahan):",
     options=["Utamakan No. Kontrak", "Utamakan Nama"],
@@ -409,15 +630,17 @@ somasi_priority = st.sidebar.radio(
     index=0
 )
 
-threshold_name        = st.sidebar.slider("Ambang Similarity Nama (0-100)",   0, 100, 80, 1)
+threshold_name = 80
+if not only_somasi_mode:
+    threshold_name = st.sidebar.slider("Ambang Similarity Nama (0-100)", 0, 100, 80, 1)
 threshold_somasi      = st.sidebar.slider("Ambang Similarity Somasi (0-100)", 0, 100, 90, 1)
 threshold_nama_bahan  = st.sidebar.slider("Ambang Fuzzy Nama (isi Somasi dari Bahan)", 0, 100, 85, 1)
 
 # =========================================
-# Jalankan minimal dengan Resi + Laporan
+# Mode penuh: Resi + Laporan. Mode Hanya Somasi: cukup Laporan.
 # =========================================
-if file_resi and file_laporan:
-    df_resi = load_resi_file(file_resi)       # <--- pakai loader baru
+if file_laporan and (file_resi or only_somasi_mode):
+    df_resi = load_resi_file(file_resi) if file_resi else pd.DataFrame()
     df_laporan = load_file_flex(file_laporan)
 
     # Siapkan df_bahan (mungkin kosong)
@@ -431,7 +654,10 @@ if file_resi and file_laporan:
 
     # --- Debug kolom
     with st.expander("🔧 Kolom terdeteksi"):
-        st.write("Resi:", list(df_resi.columns))
+        if only_somasi_mode:
+            st.write("Resi: dilewati pada mode Hanya Somasi")
+        else:
+            st.write("Resi:", list(df_resi.columns))
         st.write("Laporan:", list(df_laporan.columns))
         if not df_bahan.empty:
             for nm, cols in bahan_cols_debug:
@@ -440,21 +666,29 @@ if file_resi and file_laporan:
         else:
             st.write("Bahan: (tidak diupload)")
 
-    # --- Validasi minimum untuk mode tanpa bahan
-    required_laporan_min = ["Nama Debitur"]
-    required_resi_min    = ["Nama Penerima"]
+    # --- Validasi minimum sesuai mode
+    missing_min = []
+    if only_somasi_mode:
+        if "Nama Debitur" not in df_laporan.columns and "Nomor Kontrak" not in df_laporan.columns:
+            missing_min.append("Laporan: Nama Debitur atau Nomor Kontrak")
+    else:
+        if "Nama Debitur" not in df_laporan.columns:
+            missing_min.append("Laporan: Nama Debitur")
+        if "Nama Penerima" not in df_resi.columns:
+            missing_min.append("Resi: Nama Penerima")
 
-    missing_min = [c for c in required_laporan_min if c not in df_laporan.columns] \
-                + [c for c in required_resi_min    if c not in df_resi.columns]
     if missing_min:
         st.error(f"Kolom wajib tidak ditemukan (mode minimal): {missing_min}")
         st.stop()
 
     # --- Cast dasar
+    if 'Nama Debitur' not in df_laporan.columns:
+        df_laporan['Nama Debitur'] = pd.Series("", index=df_laporan.index, dtype='string')
     df_laporan['Nama Debitur'] = df_laporan['Nama Debitur'].astype('string').fillna("")
-    df_resi['Nama Penerima']   = df_resi['Nama Penerima'].astype('string').fillna("")
-    if 'Nomor Resi' in df_resi.columns:
-        df_resi['Nomor Resi'] = df_resi['Nomor Resi'].astype('string').fillna("")
+    if not only_somasi_mode:
+        df_resi['Nama Penerima'] = df_resi['Nama Penerima'].astype('string').fillna("")
+        if 'Nomor Resi' in df_resi.columns:
+            df_resi['Nomor Resi'] = df_resi['Nomor Resi'].astype('string').fillna("")
 
     # --- Jika ada bahan, siapkan kolom & normalisasi
     bahan_mode = not df_bahan.empty
@@ -499,7 +733,10 @@ if file_resi and file_laporan:
     cols = st.columns(3)
     with cols[0]:
         st.subheader("📄 Resi")
-        st.dataframe(make_streamlit_safe(df_resi))
+        if only_somasi_mode:
+            st.caption("Dilewati pada mode Hanya Somasi")
+        else:
+            st.dataframe(make_streamlit_safe(df_resi))
     with cols[1]:
         st.subheader("📊 Laporan")
         st.dataframe(make_streamlit_safe(df_laporan))
@@ -540,36 +777,7 @@ if file_resi and file_laporan:
         # === MODE A: FULL MATCH (fuzzy Nama Debitur ↔ Nama Penerima dari Resi) ===
         # Pencocokan 1:1 — setiap baris resi hanya boleh dipakai SEKALI
         if not only_somasi_mode:
-            # Buat daftar kandidat resi dengan index asli, agar bisa ditandai "sudah dipakai"
-            resi_candidates = []
-            for resi_idx, resi_row in df_resi.iterrows():
-                resi_candidates.append({
-                    'resi_idx': resi_idx,
-                    'nama': str(resi_row.get('Nama Penerima', '') or '').strip(),
-                    'used': False,
-                    'row': resi_row,
-                })
-
-            def fuzzy_match_name_1to1(query, candidates, min_score):
-                """Cari kandidat resi terbaik yang BELUM dipakai."""
-                query = query.strip()
-                if not query:
-                    return None, 0, -1
-                available = [(c['nama'], i) for i, c in enumerate(candidates) if not c['used'] and c['nama']]
-                if not available:
-                    return None, 0, -1
-                names_only = [a[0] for a in available]
-                res = process.extractOne(query, names_only)
-                if not res:
-                    return None, 0, -1
-                match_name, score = res
-                if score < min_score:
-                    return None, 0, -1
-                # Cari index kandidat yang cocok (ambil yang pertama ditemukan)
-                for name, cand_i in available:
-                    if name == match_name:
-                        return match_name, score, cand_i
-                return None, 0, -1
+            resi_candidates = build_name_candidates(df_resi, 'Nama Penerima')
 
             for idx, row in df_laporan_out.iterrows():
                 nm = str(row['Nama Debitur'])
@@ -716,7 +924,12 @@ if file_resi and file_laporan:
             else:
                 st.write(f"Tidak ada duplikat di kolom '{kolom}'.")
         colA, colB, colC = st.columns(3)
-        with colA: st.caption("Resi");   cek_duplikat(df_resi,  'Nama Penerima',       'duplikat_nama_penerima_resi.xlsx')
+        with colA:
+            st.caption("Resi")
+            if only_somasi_mode:
+                st.write("—")
+            else:
+                cek_duplikat(df_resi, 'Nama Penerima', 'duplikat_nama_penerima_resi.xlsx')
         with colB: st.caption("Laporan");cek_duplikat(df_laporan,'Nama Debitur',        'duplikat_nama_debitur_laporan.xlsx')
         with colC:
             st.caption("Bahan")
@@ -726,4 +939,7 @@ if file_resi and file_laporan:
                 st.write("—")
 
 else:
-    st.info("📎 Upload minimal **Resi** dan **Laporan**. Tambahkan **Bahan** bila ingin aktifkan cek Somasi.")
+    if only_somasi_mode:
+        st.info("📎 Upload **Laporan** dan **Bahan** untuk mencocokkan Nomor Surat Somasi. File Resi tidak diperlukan.")
+    else:
+        st.info("📎 Upload minimal **Resi** dan **Laporan**. Tambahkan **Bahan** bila ingin aktifkan cek Somasi.")
