@@ -457,9 +457,22 @@ if active_tab == "Pencocokan No Resi dan Detail":
             "Nama Debitur",
             "Nama Konsumen",
         )
-        detail_penerima_paket_col = find_column(df_detail_resi, "Penerima Paket")
-        detail_status_penerima_col = find_column(df_detail_resi, "Status Penerima")
-        detail_tanggal_col = find_column(df_detail_resi, "Tanggal")
+        # Dukung juga format laporan terupdate yang dipakai sebagai sumber Detail Resi.
+        detail_penerima_paket_col = find_column(
+            df_detail_resi,
+            "Penerima Paket",
+            "NAMA PENERIMA EKSPEDISI SOMASI",
+        )
+        detail_status_penerima_col = find_column(
+            df_detail_resi,
+            "Status Penerima",
+            "STATUS PENERIMA EKSPEDISI SOMASI",
+        )
+        detail_tanggal_col = find_column(
+            df_detail_resi,
+            "Tanggal",
+            "Tanggal Somasi Diterima",
+        )
 
         laporan_no_resi_col = find_column(df_laporan_detail, "Nomor Resi Pengiriman", "No Resi", "Nomor Resi")
         laporan_nama_debitur_col = find_column(
