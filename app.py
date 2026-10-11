@@ -279,10 +279,23 @@ def match_laporan_with_detail(
     detail_status_penerima_col,
     detail_tanggal_col,
     threshold_name,
+    include_on_process=False,
+    overwrite_detail=False,
 ):
     """Isi resi/detail: prioritaskan resi yang ada, lalu fuzzy match nama 1:1."""
     laporan_out = df_laporan.copy()
     detail_work = df_detail.copy()
+
+    # ON PROCESS hanya digunakan bila pengguna mengaktifkan opsi di sidebar.
+    on_process_mask = detail_work[detail_status_penerima_col].apply(
+        lambda value: re.sub(r"\s+", " ", get_str(value).strip()).upper() == "ON PROCESS"
+    )
+    excluded_on_process_resi = set(
+        detail_work.loc[on_process_mask, detail_no_resi_col].apply(normalize_resi)
+    ) - {""}
+    excluded_on_process_count = int(on_process_mask.sum()) if not include_on_process else 0
+    if not include_on_process:
+        detail_work = detail_work.loc[~on_process_mask].copy()
 
     laporan_out["__resi_norm"] = laporan_out[laporan_no_resi_col].apply(normalize_resi)
     detail_work["__resi_norm"] = detail_work[detail_no_resi_col].apply(normalize_resi)
@@ -318,15 +331,15 @@ def match_laporan_with_detail(
             laporan_out.at[report_idx, laporan_no_resi_col] = get_str(
                 detail_row.get(detail_no_resi_col)
             )
-        laporan_out.at[report_idx, laporan_penerima_col] = get_str(
-            detail_row.get(detail_penerima_paket_col)
-        )
-        laporan_out.at[report_idx, laporan_status_col] = get_str(
-            detail_row.get(detail_status_penerima_col)
-        )
-        laporan_out.at[report_idx, laporan_tanggal_col] = format_date_for_report(
-            detail_row.get(detail_tanggal_col)
-        )
+        detail_values = {
+            laporan_penerima_col: get_str(detail_row.get(detail_penerima_paket_col)),
+            laporan_status_col: get_str(detail_row.get(detail_status_penerima_col)),
+            laporan_tanggal_col: format_date_for_report(detail_row.get(detail_tanggal_col)),
+        }
+        for laporan_col, detail_value in detail_values.items():
+            existing_value = get_str(laporan_out.at[report_idx, laporan_col]).strip()
+            if overwrite_detail or not existing_value:
+                laporan_out.at[report_idx, laporan_col] = detail_value
         if similarity_score is not None:
             laporan_out.at[report_idx, laporan_similarity_col] = int(similarity_score)
 
@@ -343,7 +356,11 @@ def match_laporan_with_detail(
                     if laporan_nama_debitur_col else ""
                 ),
                 "Nomor Resi": get_str(row.get(laporan_no_resi_col)),
-                "Alasan": "Nomor resi tidak ditemukan di Detail Resi",
+                "Alasan": (
+                    "Detail Resi berstatus ON PROCESS dan opsi memasukkannya tidak aktif"
+                    if resi_norm in excluded_on_process_resi and not include_on_process
+                    else "Nomor resi tidak ditemukan di Detail Resi"
+                ),
             })
             continue
 
@@ -393,6 +410,7 @@ def match_laporan_with_detail(
         "matched_by_resi": matched_by_resi,
         "matched_by_name": matched_by_name,
         "unmatched_records": unmatched_records,
+        "excluded_on_process_count": excluded_on_process_count,
     }
 
 def write_csv_download(df: pd.DataFrame, default_filename: str):
@@ -533,6 +551,28 @@ if active_tab == "Pencocokan No Resi dan Detail":
             st.error(f"Kolom wajib tidak ditemukan: {missing_cols}")
             st.stop()
 
+        st.sidebar.subheader("⚙️ Opsi Pembaruan Detail")
+        include_on_process = st.sidebar.toggle(
+            "Masukkan resi berstatus ON PROCESS",
+            value=False,
+            help=(
+                "Saat aktif, Detail Resi dengan Status Penerima ON PROCESS ikut "
+                "dipakai untuk pencocokan."
+            ),
+            key="include_on_process",
+        )
+        update_mode = st.sidebar.radio(
+            "Cara mengisi detail di laporan",
+            ["Isi hanya kolom yang kosong", "Timpa semua data detail"],
+            index=0,
+            help=(
+                "Berlaku untuk Nama Penerima Ekspedisi, Status Penerima, dan "
+                "Tanggal Somasi Diterima."
+            ),
+            key="detail_update_mode",
+        )
+        overwrite_detail = update_mode == "Timpa semua data detail"
+
         col_lap, col_detail = st.columns(2)
         with col_lap:
             st.subheader("📊 Laporan")
@@ -564,12 +604,15 @@ if active_tab == "Pencocokan No Resi dan Detail":
                 detail_status_penerima_col=detail_status_penerima_col,
                 detail_tanggal_col=detail_tanggal_col,
                 threshold_name=threshold_detail_name,
+                include_on_process=include_on_process,
+                overwrite_detail=overwrite_detail,
             )
             df_laporan_out = match_result["laporan"]
             duplicate_detail = match_result["duplicate_detail"]
             matched_by_resi = match_result["matched_by_resi"]
             matched_by_name = match_result["matched_by_name"]
             unmatched_records = match_result["unmatched_records"]
+            excluded_on_process_count = match_result["excluded_on_process_count"]
             matched_count = matched_by_resi + matched_by_name
 
             st.subheader("✅ Hasil Pencocokan No Resi dan Detail")
@@ -579,6 +622,12 @@ if active_tab == "Pencocokan No Resi dan Detail":
             m3.metric("Via No Resi", matched_by_resi)
             m4.metric("Via Nama", matched_by_name)
             m5.metric("Tidak Cocok", len(unmatched_records))
+
+            if excluded_on_process_count:
+                st.info(
+                    f"{excluded_on_process_count} baris Detail Resi berstatus ON PROCESS "
+                    "tidak diproses. Aktifkan opsi di sidebar bila ingin memasukkannya."
+                )
 
             if not duplicate_detail.empty:
                 st.warning("Ada No Resi duplikat di Detail Resi. Aplikasi memakai baris pertama untuk pengisian laporan.")
