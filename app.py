@@ -279,29 +279,10 @@ def match_laporan_with_detail(
     detail_status_penerima_col,
     detail_tanggal_col,
     threshold_name,
-    excluded_statuses=None,
-    overwrite_detail=True,
 ):
     """Isi resi/detail: prioritaskan resi yang ada, lalu fuzzy match nama 1:1."""
     laporan_out = df_laporan.copy()
     detail_work = df_detail.copy()
-
-    # Status dibandingkan tanpa membedakan kapital/spasi agar pilihan filter konsisten.
-    excluded_statuses = {
-        re.sub(r"\s+", " ", str(status).strip()).upper()
-        for status in (excluded_statuses or [])
-        if str(status).strip()
-    }
-    excluded_resi = set()
-    excluded_detail_count = 0
-    if excluded_statuses:
-        detail_status_norm = detail_work[detail_status_penerima_col].apply(
-            lambda value: re.sub(r"\s+", " ", get_str(value)).upper()
-        )
-        excluded_rows = detail_work[detail_status_norm.isin(excluded_statuses)]
-        excluded_resi = set(excluded_rows[detail_no_resi_col].apply(normalize_resi)) - {""}
-        excluded_detail_count = len(excluded_rows)
-        detail_work = detail_work[~detail_status_norm.isin(excluded_statuses)].copy()
 
     laporan_out["__resi_norm"] = laporan_out[laporan_no_resi_col].apply(normalize_resi)
     detail_work["__resi_norm"] = detail_work[detail_no_resi_col].apply(normalize_resi)
@@ -337,17 +318,17 @@ def match_laporan_with_detail(
             laporan_out.at[report_idx, laporan_no_resi_col] = get_str(
                 detail_row.get(detail_no_resi_col)
             )
-        detail_values = {
-            laporan_penerima_col: get_str(detail_row.get(detail_penerima_paket_col)),
-            laporan_status_col: get_str(detail_row.get(detail_status_penerima_col)),
-            laporan_tanggal_col: format_date_for_report(detail_row.get(detail_tanggal_col)),
-        }
-        for laporan_col, detail_value in detail_values.items():
-            if overwrite_detail or not get_str(laporan_out.at[report_idx, laporan_col]):
-                laporan_out.at[report_idx, laporan_col] = detail_value
+        laporan_out.at[report_idx, laporan_penerima_col] = get_str(
+            detail_row.get(detail_penerima_paket_col)
+        )
+        laporan_out.at[report_idx, laporan_status_col] = get_str(
+            detail_row.get(detail_status_penerima_col)
+        )
+        laporan_out.at[report_idx, laporan_tanggal_col] = format_date_for_report(
+            detail_row.get(detail_tanggal_col)
+        )
         if similarity_score is not None:
-            if overwrite_detail or not get_str(laporan_out.at[report_idx, laporan_similarity_col]):
-                laporan_out.at[report_idx, laporan_similarity_col] = int(similarity_score)
+            laporan_out.at[report_idx, laporan_similarity_col] = int(similarity_score)
 
     # Pass 1: nomor resi yang sudah tersedia selalu mendapat prioritas.
     for idx, row in laporan_out.iterrows():
@@ -362,11 +343,7 @@ def match_laporan_with_detail(
                     if laporan_nama_debitur_col else ""
                 ),
                 "Nomor Resi": get_str(row.get(laporan_no_resi_col)),
-                "Alasan": (
-                    "Status Detail Resi dikecualikan oleh filter"
-                    if resi_norm in excluded_resi
-                    else "Nomor resi tidak ditemukan di Detail Resi"
-                ),
+                "Alasan": "Nomor resi tidak ditemukan di Detail Resi",
             })
             continue
 
@@ -416,7 +393,6 @@ def match_laporan_with_detail(
         "matched_by_resi": matched_by_resi,
         "matched_by_name": matched_by_name,
         "unmatched_records": unmatched_records,
-        "excluded_detail_count": excluded_detail_count,
     }
 
 def write_csv_download(df: pd.DataFrame, default_filename: str):
@@ -544,50 +520,6 @@ if active_tab == "Pencocokan No Resi dan Detail":
             st.error(f"Kolom wajib tidak ditemukan: {missing_cols}")
             st.stop()
 
-        status_options = sorted({
-            get_str(status)
-            for status in df_detail_resi[detail_status_penerima_col]
-            if get_str(status)
-        }, key=str.upper)
-        on_process_statuses = [
-            status for status in status_options
-            if re.sub(r"\s+", " ", status.strip()).upper() == "ON PROCESS"
-        ]
-        st.sidebar.subheader("⚙️ Opsi Pembaruan Detail")
-        include_on_process = st.sidebar.toggle(
-            "Masukkan resi berstatus ON PROCESS",
-            value=False,
-            help=(
-                "Aktifkan bila resi dengan Status Penerima ON PROCESS tetap boleh "
-                "dipakai untuk pencocokan dan pembaruan laporan."
-            ),
-            key="include_on_process",
-        )
-        other_status_options = [
-            status for status in status_options if status not in on_process_statuses
-        ]
-        other_excluded_statuses = st.sidebar.multiselect(
-            "Status lain yang tidak diproses",
-            options=other_status_options,
-            default=[],
-            help=(
-                "Resi dengan status terpilih tidak dipakai untuk pencocokan atau "
-                "pengisian laporan."
-            ),
-            key="other_excluded_detail_statuses",
-        )
-        excluded_detail_statuses = list(other_excluded_statuses)
-        if not include_on_process:
-            excluded_detail_statuses.extend(on_process_statuses)
-        update_mode = st.sidebar.radio(
-            "Cara mengisi detail di laporan",
-            options=["Isi hanya kolom yang kosong", "Timpa data laporan yang sudah ada"],
-            index=0,
-            help="Berlaku untuk Nama Penerima, Status Penerima, dan Tanggal Diterima.",
-            key="detail_update_mode",
-        )
-        overwrite_detail = update_mode == "Timpa data laporan yang sudah ada"
-
         col_lap, col_detail = st.columns(2)
         with col_lap:
             st.subheader("📊 Laporan")
@@ -619,15 +551,12 @@ if active_tab == "Pencocokan No Resi dan Detail":
                 detail_status_penerima_col=detail_status_penerima_col,
                 detail_tanggal_col=detail_tanggal_col,
                 threshold_name=threshold_detail_name,
-                excluded_statuses=excluded_detail_statuses,
-                overwrite_detail=overwrite_detail,
             )
             df_laporan_out = match_result["laporan"]
             duplicate_detail = match_result["duplicate_detail"]
             matched_by_resi = match_result["matched_by_resi"]
             matched_by_name = match_result["matched_by_name"]
             unmatched_records = match_result["unmatched_records"]
-            excluded_detail_count = match_result["excluded_detail_count"]
             matched_count = matched_by_resi + matched_by_name
 
             st.subheader("✅ Hasil Pencocokan No Resi dan Detail")
@@ -637,12 +566,6 @@ if active_tab == "Pencocokan No Resi dan Detail":
             m3.metric("Via No Resi", matched_by_resi)
             m4.metric("Via Nama", matched_by_name)
             m5.metric("Tidak Cocok", len(unmatched_records))
-
-            if excluded_detail_count:
-                st.info(
-                    f"{excluded_detail_count} baris Detail Resi tidak diproses sesuai filter status: "
-                    f"{', '.join(excluded_detail_statuses)}."
-                )
 
             if not duplicate_detail.empty:
                 st.warning("Ada No Resi duplikat di Detail Resi. Aplikasi memakai baris pertama untuk pengisian laporan.")
