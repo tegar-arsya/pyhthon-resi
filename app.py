@@ -481,56 +481,9 @@ if active_tab == "Pencocokan No Resi dan Detail":
             "Nama Debitur",
             "Nama Konsumen",
         )
-        detail_penerima_paket_col = find_column(
-            df_detail_resi,
-            "Penerima Paket",
-            "Penerima",
-            "Nama Penerima Paket",
-            "Nama Penerima",
-        )
-        detail_status_penerima_col = find_column(
-            df_detail_resi,
-            "Status Penerima",
-            "Status Pengiriman",
-            "Status Resi",
-            "Status",
-        )
-        detail_tanggal_col = find_column(
-            df_detail_resi,
-            "Tanggal",
-            "Tanggal Terima",
-            "Tanggal Diterima",
-            "Tanggal Pengiriman",
-        )
-
-        # Jika judul kolom dari ekspedisi berbeda, pengguna tetap dapat
-        # memetakan kolomnya sendiri tanpa perlu mengubah file Excel.
-        def choose_detail_column(label, detected_column, widget_key):
-            options = [None] + list(df_detail_resi.columns)
-            selected_index = options.index(detected_column) if detected_column in options else 0
-            return st.sidebar.selectbox(
-                label,
-                options=options,
-                index=selected_index,
-                format_func=lambda column: "-- Pilih kolom --" if column is None else column,
-                key=widget_key,
-            )
-
-        detail_penerima_paket_col = choose_detail_column(
-            "Kolom Detail: Penerima Paket",
-            detail_penerima_paket_col,
-            "detail_penerima_paket_column",
-        )
-        detail_status_penerima_col = choose_detail_column(
-            "Kolom Detail: Status Penerima",
-            detail_status_penerima_col,
-            "detail_status_penerima_column",
-        )
-        detail_tanggal_col = choose_detail_column(
-            "Kolom Detail: Tanggal",
-            detail_tanggal_col,
-            "detail_tanggal_column",
-        )
+        detail_penerima_paket_col = find_column(df_detail_resi, "Penerima Paket")
+        detail_status_penerima_col = find_column(df_detail_resi, "Status Penerima")
+        detail_tanggal_col = find_column(df_detail_resi, "Tanggal")
 
         laporan_no_resi_col = find_column(df_laporan_detail, "Nomor Resi Pengiriman", "No Resi", "Nomor Resi")
         laporan_nama_debitur_col = find_column(
