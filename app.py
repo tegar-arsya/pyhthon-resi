@@ -3,6 +3,8 @@ import pandas as pd
 from fuzzywuzzy import process
 from io import BytesIO
 from PIL import Image
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import re
 
 # =========================
@@ -167,7 +169,17 @@ def make_streamlit_safe(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # Writer Excel (openpyxl → fallback xlsxwriter)
 # =========================
+def filename_with_timestamp(filename: str) -> str:
+    """Tambahkan waktu WIB ke nama file unduhan tanpa mengubah ekstensinya."""
+    stem, dot, extension = filename.rpartition(".")
+    if not dot:
+        stem, extension = filename, ""
+    timestamp = datetime.now(ZoneInfo("Asia/Jakarta")).strftime("%Y%m%d_%H%M%S")
+    return f"{stem}_{timestamp}{dot}{extension}" if dot else f"{stem}_{timestamp}"
+
+
 def write_excel_download(df: pd.DataFrame, default_filename: str):
+    download_filename = filename_with_timestamp(default_filename)
     output = BytesIO()
     try:
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -177,9 +189,9 @@ def write_excel_download(df: pd.DataFrame, default_filename: str):
             df.to_excel(writer, index=False, sheet_name="Hasil")
     output.seek(0)
     st.download_button(
-        label=f"📥 Download {default_filename}",
+        label=f"📥 Download {download_filename}",
         data=output,
-        file_name=default_filename,
+        file_name=download_filename,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
@@ -414,11 +426,12 @@ def match_laporan_with_detail(
     }
 
 def write_csv_download(df: pd.DataFrame, default_filename: str):
+    download_filename = filename_with_timestamp(default_filename)
     data = df.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
-        label=f"📥 Download {default_filename}",
+        label=f"📥 Download {download_filename}",
         data=data,
-        file_name=default_filename,
+        file_name=download_filename,
         mime="text/csv",
     )
 
